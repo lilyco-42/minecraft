@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 本地运行产物
+run_test.log
+ws_test.txt
+unit_test.txt
+*.log
+
+# 工具会话状态
+.agents/
+
+# 编辑器
+.idea/
+.vscode/

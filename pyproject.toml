@@ -1,0 +1,14 @@
+[project]
+name = "minecraft-remote"
+version = "0.1.0"
+description = "Windows 一键管理局域网 Radxa Minecraft 服务器 (mDNS发现 + SSH遥控 + FastAPI网页控制台)"
+requires-python = ">=3.10"
+dependencies = [
+    "paramiko>=3.4",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "websockets>=16.1.1",
+]
+
+[tool.uv]
+package = false
