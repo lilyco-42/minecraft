@@ -9,6 +9,9 @@ ws_test.txt
 unit_test.txt
 *.log
 
+# Nuitka 打包产物
+build/
+
 # 工具会话状态
 .agents/
 
