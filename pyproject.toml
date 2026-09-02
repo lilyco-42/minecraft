@@ -12,3 +12,9 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "nuitka>=4.2",
+    "zstandard>=0.25.0",
+]
