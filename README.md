@@ -43,3 +43,30 @@ Windows 上一键管理局域网 Radxa 板子上的 Minecraft (Paper) 服务器�
 ## 关闭面板 = 关服吗?
 
 不是。关掉窗口只结束本地面板,远程服务器继续跑(screen 里)。停止服务器请用面板的 ■ 停止按钮或在控制台发 `stop`。
+
+## 手机端 (Android WebView App)
+
+`android/` 里是极简 WebView 壳, 加载 radxa 上常驻的控制台页面。
+
+### 前置: radxa 部署控制台 (一次性)
+
+```bash
+# 本地上传到 radxa
+pscp radxa_server/radxa_console.py radxa_server/index.html radxa@192.168.10.165:mc/console/
+# radxa 上 (radxa_console.py 与 index.html 同目录)
+ssh radxa@192.168.10.165
+cd ~/mc/console && python3 -m venv venv
+./venv/bin/pip install fastapi 'uvicorn[standard]' websockets
+screen -dmS mcconsole bash -c 'cd ~/mc/console && exec ./venv/bin/python radxa_console.py > console.log 2>&1'
+```
+
+之后手机/任意浏览器访问 `http://192.168.10.165:8765` 即可, 不依赖 PC 开机。
+
+### APK 构建 (纯 Android SDK CLI, 无 gradle)
+
+```bash
+bash android/build_apk.sh   # 产物: android/out/mc-console.apk
+```
+
+需要: ANDROID_HOME 下的 build-tools/36 + platforms/android-36 + JDK (javac/keytool)。
+APK 默认加载 `http://192.168.10.165:8765`; 调试可用 `--es url` 覆盖。
