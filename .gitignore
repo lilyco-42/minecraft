@@ -12,6 +12,9 @@ unit_test.txt
 # Nuitka 打包产物
 build/
 
+# Android 构建产物
+android/out/
+
 # 工具会话状态
 .agents/
 
