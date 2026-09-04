@@ -1,0 +1,39 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+      
+      - name: Build WebView DLL
+        run: |
+          git clone https://github.com/webview/webview.git webview-src
+          cd webview-src && mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DWEBVIEW_BUILD_SHARED_LIBRARY=ON
+          cmake --build . --config Release --target webview_core_shared
+          copy build/core/Release/webview.dll ../webview-capi/
+      
+      - name: Test DLL
+        run: |
+          cd webview-capi
+          cl /nologo test_dll.c /link user32.lib /OUT:test_dll.exe
+      
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: webview-capi-windows
+          path: |
+            webview-capi/webview.dll
+            webview-capi/webview.h
+            webview-capi/webview.lib

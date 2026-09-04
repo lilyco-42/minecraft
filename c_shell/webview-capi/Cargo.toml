@@ -1,0 +1,20 @@
+[package]
+name = "webview-capi"
+version = "0.1.0"
+edition = "2021"
+description = "C API for WebView2 - callable from any language"
+license = "MIT"
+repository = "https://github.com/lilyco-42/webview-capi"
+keywords = ["webview", "webview2", "c-api", "ffi"]
+categories = ["ffi", "gui"]
+
+[lib]
+name = "webview_capi"
+path = "src/lib.rs"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.0"
