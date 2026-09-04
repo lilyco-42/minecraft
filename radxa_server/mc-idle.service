@@ -1,0 +1,14 @@
+[Unit]
+Description=Minecraft idle auto-shutdown check
+Documentation=file:///home/radxa/mc/bin/mc-idle-shutdown.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 必须以 radxa 运行: screen 会话在该用户下
+User=radxa
+Environment=IDLE_MINUTES=10
+ExecStart=/home/radxa/mc/bin/mc-idle-shutdown.sh
+
+[Install]
+WantedBy=multi-user.target

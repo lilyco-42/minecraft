@@ -1,0 +1,13 @@
+[Unit]
+Description=Minecraft schedule %i
+Documentation=file:///home/radxa/mc/bin/mc-schedule.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 必须是 radxa 用户: screen 会话在该用户下
+User=radxa
+ExecStart=/home/radxa/mc/bin/mc-schedule.sh %i
+
+[Install]
+WantedBy=multi-user.target

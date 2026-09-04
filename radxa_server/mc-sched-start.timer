@@ -1,0 +1,14 @@
+[Unit]
+Description=Start Minecraft at 08:30 daily
+
+[Timer]
+# 模板单元不会按 timer 文件名自动推导, 必须显式指定实例
+Unit=mc-sched@start.service
+# 每天 08:30 启动 (周一~周日)
+# 周末本来就该全天开着, 触发时若已在运行会自动跳过, 所以每天跑无副作用
+OnCalendar=*-*-* 08:30:00
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

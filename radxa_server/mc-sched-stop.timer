@@ -1,0 +1,17 @@
+[Unit]
+Description=Stop Minecraft at 02:00 on weekdays
+
+[Timer]
+# 模板单元不会按 timer 文件名自动推导, 必须显式指定实例
+Unit=mc-sched@stop.service
+# 周二~周五 02:00 停服。
+# 刻意跳过周一/周六/周日:
+#   周一 02:00 属于周末尾巴, 停了周一 08:30 又要开, 中间 6.5 小时没意义;
+#   周六、周日按需求全天保持开启。
+# 于是周五 08:30 开机后会一直开到周二 02:00 (跨过整个周末)。
+OnCalendar=Tue..Fri 02:00:00
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

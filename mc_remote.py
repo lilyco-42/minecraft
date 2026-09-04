@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
 """Minecraft Radxa 远程管理器 — 一键发现、启动、网页控制局域网 MC 服务器.
 
-用法:  uv run mc_remote.py   或   python mc_remote.py
-流程:  mDNS/ARP 发现 radxa -> SSH 连接 -> screen 启动服务 -> 打开网页控制台
+纯标准库实现 (无 paramiko/fastapi), 体积和资源占用最小化:
+- SSH: 子进程调用 plink.exe (PuTTY, -hostkey 固定指纹, -batch 非交互)
+- Web: http.server + 手写 WebSocket (单端点文本帧, ~百行)
+- 用法:  uv run mc_remote.py   或打包后的 mc_remote.exe
+
+流程:  已知IP/mDNS/ARP 发现 radxa -> plink 连接 -> screen 启动服务 -> 控制台
 """
 
 from __future__ import annotations
 
-import asyncio
+import base64
+import hashlib
 import json
+import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-import paramiko
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
 
 # ─── 配置 ─────────────────────────────────────────────
 STATIC_IP = "192.168.10.165"  # 已知 radxa IP (优先使用; None 则纯自动发现)
 MDNS_HOST = "radxa-cubie-a7a.local"  # radxa 的 mDNS 主机名
-ARP_IP_RANGE = "192.168.10.0/24"  # mDNS 失败时的后备网段
 SSH_USER = "radxa"
 SSH_PASSWORD = "radxa"
 SERVER_DIR = "~/mc/server"  # 远程 setup.sh 所在目录
@@ -37,8 +39,7 @@ MAX_BUF = 2000
 POLL_SEC = 2.0  # 日志轮询间隔(秒)
 
 SSH_HOSTKEY = "SHA256:dunkCOziifjFyaXvg1SJRusTL0Kv9BicwEdwXB/weHI"
-
-app = FastAPI(title="MC Radxa 控制台")
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 # ─── 发现: 已知IP -> mDNS(校验私网) -> ARP 扫描后备 ───────
@@ -94,28 +95,48 @@ def discover() -> tuple[str, str]:
     raise RuntimeError("未找到 radxa: mDNS 解析失败, ARP 扫描也未发现 SSH 主机")
 
 
-# ─── SSH 远程执行 ──────────────────────────────────────
+# ─── plink 查找: 环境变量 -> exe 旁 -> Program Files -> PATH ──
+def _plink_exe() -> str:
+    cands = [
+        os.environ.get("PLINK_PATH", ""),
+        str(Path(__file__).parent / "plink.exe"),
+        str(Path(sys.argv[0]).parent / "plink.exe"),
+        r"C:\Program Files\PuTTY\plink.exe",
+        "plink",
+    ]
+    for c in cands:
+        if not c:
+            continue
+        if os.path.sep in c or c.lower().endswith(".exe"):
+            if os.path.isfile(c):
+                return c
+        elif re.search(r"[\\/]|\bplink\b", c):  # PATH 里的 plink
+            return c
+    raise RuntimeError("找不到 plink.exe, 请安装 PuTTY 或设置 PLINK_PATH")
+
+
+PLINK = _plink_exe()
+
+
+# ─── SSH 远程执行 (plink 子进程, 每次调用独立) ──────────
 class Remote:
-    """维持一条 SSH 连接; exec 每次开新 channel(线程安全)。"""
+    """封装 plink 调用; 无常驻连接, 天然线程安全。"""
 
     def __init__(self, host: str):
         self.host = host
-        self.cli = paramiko.SSHClient()
-        self.cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.cli.connect(
-            host, username=SSH_USER, password=SSH_PASSWORD,
-            look_for_keys=False, allow_agent=False, timeout=8,
-        )
         self._log_pos = 0  # latest.log 已读字节游标
 
     def run(self, cmd: str, timeout: int = 15) -> str:
-        _, out, err = self.cli.exec_command(cmd, timeout=timeout)
-        rc = out.channel.recv_exit_status()
-        text = out.read().decode("utf-8", "replace")
-        e = err.read().decode("utf-8", "replace").strip()
-        if rc != 0 and e:
-            return f"[exit {rc}] {e}"
-        return text
+        p = subprocess.run(
+            [PLINK, "-batch", "-ssh", f"{SSH_USER}@{self.host}", "-pw", SSH_PASSWORD,
+             "-hostkey", SSH_HOSTKEY, cmd],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+        err = p.stderr.strip()
+        if p.returncode != 0 and err:
+            return f"[exit {p.returncode}] {err}"
+        return p.stdout
 
     # ── 服务器生命周期 ──
     def mc_start(self) -> str:
@@ -123,14 +144,12 @@ class Remote:
 
     def mc_stop(self) -> str:
         self.send("stop")
-        for _ in range(60):  # 最多等 60s 优雅关闭
-            time.sleep(1)
-            if not self.is_running():
-                return "服务器已停止"
+        for _ in range(30):  # 最多等 60s 优雅关闭
+            time.sleep(2)
+            if self.is_running():
+                continue
+            return "服务器已停止"
         return "60s 未退出, 可能仍需手动检查 (screen -r mc)"
-
-    def mc_status(self) -> bool:
-        return self.is_running()
 
     def is_running(self) -> bool:
         out = self.run("screen -ls 2>/dev/null | grep -cE '[.]mc[[:space:]]' || true")
@@ -157,57 +176,61 @@ class Remote:
         carriage_return = "$(printf '\\r')"
         self.run(f'screen -S mc -p 0 -X stuff "{safe}{carriage_return}"')
 
-    # ── 日志: 增量读 latest.log (tail -c 跳过已读字节) ──
+    # ── 日志+存活: 一次 plink 同时取 (减少进程开销) ──
     LOG_PATH = f"{SERVER_DIR}/minecraft/logs/latest.log"
 
-    def tail_log_init(self) -> list[str]:
-        """首次连接读最后 N 行, 并把游标推到文件尾。"""
+    def poll_init(self) -> list[str]:
+        """首次连接读最后 N 行 + 存活, 并把游标推到文件尾。"""
         out = self.run(
             f"tail -n {LOG_LINES} {self.LOG_PATH} 2>/dev/null; "
-            f"echo __POS__$(wc -c < {self.LOG_PATH} 2>/dev/null || echo 0)"
+            f"echo __POS__$(wc -c < {self.LOG_PATH} 2>/dev/null || echo 0); "
+            f"echo __ALIVE__$(screen -ls 2>/dev/null | grep -cE '[.]mc[[:space:]]' || true)"
         )
-        lines = []
-        pos = 0
+        lines, pos = [], 0
         for l in out.splitlines():
             if l.startswith("__POS__"):
                 pos = int(l[7:] or 0)
+            elif l.startswith("__ALIVE__"):
+                self.last_alive = l[9:].strip() not in ("", "0")
             elif l:
                 lines.append(l)
         self._log_pos = pos
         return lines
 
-    def tail_log(self) -> list[str]:
-        """增量: 从 _log_pos 字节处读到文件尾, 推进游标 (只取完整行)。"""
+    last_alive = False
+
+    def poll_once(self) -> tuple[list[str], bool]:
+        """增量: 从 _log_pos 读到文件尾 + 存活状态, 一次 plink 完成。"""
         out = self.run(
             f"tail -c +$(( {self._log_pos} + 1 )) {self.LOG_PATH} 2>/dev/null; "
-            f"echo __POS__$(wc -c < {self.LOG_PATH} 2>/dev/null || echo 0)"
+            f"echo __POS__$(wc -c < {self.LOG_PATH} 2>/dev/null || echo 0); "
+            f"echo __ALIVE__$(screen -ls 2>/dev/null | grep -cE '[.]mc[[:space:]]' || true)"
         )
-        lines = []
-        pos = self._log_pos
+        lines, pos, alive = [], self._log_pos, self.last_alive
         for l in out.splitlines():
             if l.startswith("__POS__"):
                 pos = int(l[7:] or self._log_pos)
+            elif l.startswith("__ALIVE__"):
+                alive = l[9:].strip() not in ("", "0")
             elif l:
                 lines.append(l)
-        # 最后一条可能是不完整行: 若文件还在增长, 尾行会下次重发
         if pos < self._log_pos:  # 日志轮转/重启, 从头读
             pos = 0
         self._log_pos = pos
-        return lines
+        self.last_alive = alive
+        return lines, alive
 
     def close(self):
-        try:
-            self.cli.close()
-        except Exception:
-            pass
+        pass  # 无常驻连接, 无需清理
 
 
 # ─── 全局状态 ──────────────────────────────────────────
 remote: Remote | None = None
 log_buf: list[str] = []
-# 每个 ws 一个队列; poller 线程只投递, 发送由各连接的 async task 完成
-ws_queues: dict[WebSocket, asyncio.Queue] = {}
-poller: threading.Thread | None = None
+# 每个 ws 连接一个队列; poller 线程只投递, 发送由各连接线程完成
+ws_queues: dict[int, tuple[object, "queue.Queue"]] = {}  # id -> (handler, queue)
+import queue  # noqa: E402  (放这里只为可读性: 仅此一处使用)
+
 poller_stop = threading.Event()
 
 
@@ -220,35 +243,30 @@ def log(msg: str):
 
 def ws_enqueue(payload: dict):
     """线程安全: 把消息投递到所有 ws 队列 (满则丢弃该客户端积压)。"""
-    for q in list(ws_queues.values()):
+    for _, (_h, q) in list(ws_queues.items()):
         if q.full():
             continue
         q.put_nowait(payload)
 
 
 def poll_loop():
-    """后台线程: 轮询远程日志 + 存活状态, 投递到 ws 队列。"""
+    """后台线程: 轮询远程日志 + 存活状态 (单次 plink), 投递到 ws 队列。"""
     global remote
-    last_alive = None
     while not poller_stop.is_set():
         try:
-            if remote is None:
-                time.sleep(POLL_SEC)
-                continue
-            for line in remote.tail_log():
-                log(line)
-                ws_enqueue({"type": "log", "data": line})
-            alive = remote.is_running()
-            if alive != last_alive:
-                last_alive = alive
-                ws_enqueue({"type": "status", "data": alive})
+            if remote is not None:
+                lines, alive = remote.poll_once()
+                for line in lines:
+                    log(line)
+                    ws_enqueue({"type": "log", "data": line})
+                if alive != remote.last_alive or lines:
+                    ws_enqueue({"type": "status", "data": alive})
         except Exception as e:
             msg = f"[Ctrl] 连接异常: {e}"
             log(msg)
             ws_enqueue({"type": "log", "data": msg})
             try:
                 ip, _ = discover()
-                remote.close()
                 remote = Remote(ip)
                 log("[Ctrl] 已重连")
                 ws_enqueue({"type": "log", "data": "[Ctrl] 已重连"})
@@ -257,73 +275,189 @@ def poll_loop():
         poller_stop.wait(POLL_SEC)
 
 
-# ─── FastAPI 路由 ──────────────────────────────────────
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return (Path(__file__).parent / "web" / "index.html").read_text("utf-8")
+# ─── WebSocket 帧编解码 (仅文本帧, RFC6455 最小实现) ───────
+def _ws_send(sock, text: str) -> None:
+    payload = text.encode("utf-8")
+    n = len(payload)
+    if n < 126:
+        head = struct.pack("!BB", 0x81, n)
+    elif n < 65536:
+        head = struct.pack("!BBH", 0x81, 126, n)
+    else:
+        head = struct.pack("!BBQ", 0x81, 127, n)
+    sock.sendall(head + payload)
 
 
-@app.get("/api/status")
-async def api_status():
-    if remote is None:
-        return {"ok": False, "running": False, "ip": None}
-    return {"ok": True, "running": remote.is_running(), "ip": remote.host}
+def _ws_recv(sock) -> str | None:
+    """读一帧文本; 返回 None 表示连接结束。拼接 continuation 帧。"""
+    buf = b""
+    while True:
+        hdr = _recv_exact(sock, 2)
+        if hdr is None:
+            return None
+        fin_op, ln = hdr
+        opcode = fin_op & 0x0F
+        masked = ln & 0x80
+        ln &= 0x7F
+        if ln == 126:
+            ext = _recv_exact(sock, 2)
+            if ext is None:
+                return None
+            ln = struct.unpack("!H", ext)[0]
+        elif ln == 127:
+            ext = _recv_exact(sock, 8)
+            if ext is None:
+                return None
+            ln = struct.unpack("!Q", ext)[0]
+        mask = _recv_exact(sock, 4) if masked else b"\x00\x00\x00\x00"
+        payload = _recv_exact(sock, ln) if ln else b""
+        if payload is None:
+            return None
+        if masked and mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if opcode == 0x8:  # close
+            try:
+                sock.sendall(struct.pack("!BB", 0x88, 0))
+            except OSError:
+                pass
+            return None
+        if opcode == 0x9:  # ping -> pong
+            sock.sendall(bytes([0x8A, len(payload)]) + payload)
+            continue
+        if opcode in (0x1, 0x2, 0x0):  # text/binary/continuation
+            buf += payload
+            if fin_op & 0x80:  # FIN: 消息结束
+                return buf.decode("utf-8", "replace")
 
 
-@app.post("/api/start")
-async def api_start():
-    if remote is None:
-        return {"ok": False, "msg": "未连接"}
-    if remote.is_running():
-        return {"ok": False, "msg": "已在运行"}
-    return {"ok": True, "msg": remote.mc_start()}
+def _recv_exact(sock, n: int) -> bytes | None:
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
 
 
-@app.post("/api/stop")
-async def api_stop():
-    if remote is None:
-        return {"ok": False, "msg": "未连接"}
-    if not remote.is_running():
-        return {"ok": False, "msg": "未在运行"}
-    # stop 是阻塞 60s 的, 丢线程里跑
-    threading.Thread(target=remote.mc_stop, daemon=True).start()
-    return {"ok": True, "msg": "停止指令已发送 (最多等待 60s)"}
+# ─── HTTP 处理 ────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    server_version = "MCConsole/2.0"
+    protocol_version = "HTTP/1.1"
 
-
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
-    q: asyncio.Queue = asyncio.Queue(maxsize=500)
-    ws_queues[ws] = q
-
-    async def sender():
-        while True:
-            payload = await q.get()
-            await ws.send_text(json.dumps(payload, ensure_ascii=False))
-
-    send_task = asyncio.create_task(sender())
-    try:
-        # 连上先补发缓冲日志和当前状态
-        for line in list(log_buf)[-LOG_LINES:]:
-            await ws.send_text(json.dumps({"type": "log", "data": line}, ensure_ascii=False))
-        if remote:
-            await ws.send_text(json.dumps({"type": "status", "data": remote.is_running()}, ensure_ascii=False))
-        while True:
-            raw = await ws.receive_text()
-            if raw.startswith("/"):
-                cmd = raw[1:]
-                if remote:
-                    # SSH exec 不宜在 event loop 里同步调用, 丢线程
-                    threading.Thread(target=remote.send, args=(cmd,), daemon=True).start()
-                    log(f"> {cmd}")
-                    await ws.send_text(json.dumps({"type": "echo", "data": cmd}, ensure_ascii=False))
-            else:
-                await ws.send_text(json.dumps({"type": "sys", "data": "命令需以 / 开头"}, ensure_ascii=False))
-    except WebSocketDisconnect:
+    def log_message(self, *args):  # 静默访问日志, 控制台保持干净
         pass
-    finally:
-        send_task.cancel()
-        ws_queues.pop(ws, None)
+
+    # ── GET ──
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/":
+            html = (Path(__file__).parent / "web" / "index.html").read_text("utf-8")
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/api/status":
+            self._json({"ok": remote is not None, "running": bool(remote and remote.last_alive), "ip": remote.host if remote else None})
+        elif path == "/ws":
+            self._websocket()
+        else:
+            self.send_error(404)
+
+    # ── POST ──
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        # 读取并丢弃请求体 (fetch 无 body 但保持协议干净)
+        cl = self.headers.get("Content-Length")
+        if cl:
+            self.rfile.read(int(cl))
+        if path == "/api/start":
+            if remote is None:
+                self._json({"ok": False, "msg": "未连接"})
+            elif remote.last_alive:
+                self._json({"ok": False, "msg": "已在运行"})
+            else:
+                self._json({"ok": True, "msg": remote.mc_start() or "启动中"})
+        elif path == "/api/stop":
+            if remote is None:
+                self._json({"ok": False, "msg": "未连接"})
+            elif not remote.last_alive:
+                self._json({"ok": False, "msg": "未在运行"})
+            else:
+                # stop 是阻塞 60s 的, 丢线程里跑
+                threading.Thread(target=remote.mc_stop, daemon=True).start()
+                self._json({"ok": True, "msg": "停止指令已发送 (最多等待 60s)"})
+        else:
+            self.send_error(404)
+
+    def _json(self, obj: dict):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ── WebSocket 升级 + 双向收发 (本连接内线程完成) ──
+    def _websocket(self):
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key or "websocket" not in self.headers.get("Upgrade", "").lower():
+            self.send_error(400)
+            return
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode()).digest()
+        ).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True  # 升级后由下面的帧循环接管
+
+        sock = self.connection
+        q: queue.Queue = queue.Queue(maxsize=500)
+        ws_queues[id(self)] = (self, q)
+        try:
+            # 连上先补发缓冲日志和当前状态
+            for line in list(log_buf)[-LOG_LINES:]:
+                _ws_send(sock, json.dumps({"type": "log", "data": line}, ensure_ascii=False))
+            if remote:
+                _ws_send(sock, json.dumps({"type": "status", "data": remote.last_alive}, ensure_ascii=False))
+            # 发送线程: 队列 -> 帧
+            sender_stop = threading.Event()
+
+            def sender():
+                while not sender_stop.is_set():
+                    try:
+                        payload = q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    _ws_send(sock, json.dumps(payload, ensure_ascii=False))
+
+            st = threading.Thread(target=sender, daemon=True)
+            st.start()
+            try:
+                while True:
+                    raw = _ws_recv(sock)
+                    if raw is None:
+                        break
+                    if raw.startswith("/"):
+                        cmd = raw[1:]
+                        if remote:
+                            threading.Thread(target=remote.send, args=(cmd,), daemon=True).start()
+                            log(f"> {cmd}")
+                            q.put({"type": "echo", "data": cmd})
+                    else:
+                        q.put({"type": "sys", "data": "命令需以 / 开头"})
+            finally:
+                sender_stop.set()
+        except OSError:
+            pass
+        finally:
+            ws_queues.pop(id(self), None)
 
 
 # ─── 主流程 ───────────────────────────────────────────
@@ -343,24 +477,20 @@ def main():
         return
     print(f"  找到: {ip} ({how})")
 
-    print("[2/3] SSH 连接 ...")
+    print("[2/3] SSH 连接 (plink) ...")
     try:
         remote = Remote(ip)
+        remote.poll_init()
     except Exception as e:
         print(f"  SSH 失败: {e}")
         input("按回车退出...")
         return
     print(f"  已连接 {SSH_USER}@{ip}")
-
-    print("[3/3] 检查服务器状态 ...")
-    if remote.is_running():
-        print("  服务器已在运行 (screen: mc)")
-    else:
+    if not remote.last_alive:
         print("  启动中 ...")
         print("  " + remote.mc_start().strip().replace("\n", " | "))
-
-    for line in remote.tail_log_init():
-        log(line)
+    else:
+        print("  服务器已在运行 (screen: mc)")
 
     poller_stop.clear()
     threading.Thread(target=poll_loop, daemon=True).start()
@@ -369,12 +499,12 @@ def main():
     print(f"\n控制台: {url}  (浏览器将自动打开, Ctrl+C 退出)")
     webbrowser.open(url)
     try:
-        uvicorn.run(app, host=WEB_HOST, port=WEB_PORT, log_config=None)
+        httpd = ThreadingHTTPServer((WEB_HOST, WEB_PORT), Handler)
+        httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         poller_stop.set()
-        remote.close()
         print("已退出 (远程服务器保持运行)")
 
 

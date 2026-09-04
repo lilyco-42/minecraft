@@ -1,0 +1,14 @@
+[Unit]
+Description=MC Web Console (FastAPI panel on :8765)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=radxa
+WorkingDirectory=/home/radxa/mc/console
+ExecStart=/home/radxa/mc/console/venv/bin/python radxa_console.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
