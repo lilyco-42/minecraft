@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 200" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1a0d"/><stop offset="1" stop-color="#14532d"/>
+    </linearGradient>
+    <linearGradient id="ac" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4ade80"/><stop offset="1" stop-color="#86efac"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="200" fill="url(#bg)"/>
+  <circle cx="540" cy="30" r="80" fill="#4ade80" opacity="0.08"/>
+  <text x="552" y="164" font-size="84" font-weight="700" fill="#4ade80" opacity="0.30" text-anchor="end" font-family="Consolas,monospace">MC</text>
+  <rect x="0" y="0" width="6" height="200" fill="url(#ac)"/>
+  <rect x="36" y="46" height="34" rx="17" width="100" fill="#4ade80" opacity="0.14" stroke="#4ade80"/>
+  <text x="86" y="69" font-size="15" fill="#86efac" text-anchor="middle">Python</text>
+  <text x="36" y="126" font-size="32" font-weight="700" fill="#f8fafc">MC Radxa 管理器</text>
+  <text x="36" y="158" font-size="17" fill="#86efac">mDNS 发现 + SSH 一键启停 · 网页控制台 · 实时日志 · 中文手册</text>
+</svg>
