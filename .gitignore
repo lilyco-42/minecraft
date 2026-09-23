@@ -21,3 +21,5 @@ android/out/
 # 编辑器
 .idea/
 .vscode/
+c_shell/*.obj
+c_shell/*.pdb
